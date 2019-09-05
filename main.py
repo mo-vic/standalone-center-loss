@@ -12,10 +12,11 @@ from utils.utils import train, eval
 from utils.logger import Logger
 
 from losses.xentropy_loss import CrossEntropyLoss
+from losses.center_loss import CenterLoss
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Softmax + Xentropy")
+    parser = argparse.ArgumentParser(description="Center Loss.")
 
     # Dataset
     parser.add_argument("--dataset", type=str, default="fashion-mnist", choices=["mnist", "fashion-mnist", "cifar-10"])
@@ -25,6 +26,7 @@ def main():
     parser.add_argument("--batch_size", type=int, default=128, help="Batch size.")
     parser.add_argument("--gpu_ids", type=str, default='', help="GPUs for running this script.")
     parser.add_argument("--lr", type=float, default=0.01, help="Learning rate for gradient descent.")
+    parser.add_argument("--weight_cent", type=float, default=1.0, help="Weight for center loss.")
     parser.add_argument("--factor", type=float, default=0.2, help="Factor by which the learning rate will be reduced.")
     parser.add_argument("--patience", type=int, default=10,
                         help="Number of epochs with no improvement after which learning rate will be reduced.")
@@ -76,8 +78,9 @@ def main():
     trainloader, testloader, input_shape, classes = load_dataset(args.dataset, args.batch_size, use_gpu,
                                                                  args.num_workers)
     model = build_model(args.model, input_shape, args.feat_dim, len(classes))
-    criterion = CrossEntropyLoss()
-    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
+    criterion_xent = CrossEntropyLoss()
+    criterion_cent = CenterLoss(len(classes), feat_dim=args.feat_dim)
+    optimizer = torch.optim.SGD(list(model.parameters()) + list(criterion_cent.parameters()), lr=args.lr, momentum=0.9)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=args.factor,
                                                            patience=args.patience, verbose=True,
                                                            threshold=args.threshold)
@@ -90,12 +93,12 @@ def main():
     start = datetime.now()
     with SummaryWriter(log_dir) as writer:
         for epoch in range(args.epochs):
-            train(model, trainloader, criterion, optimizer, use_gpu, writer, epoch, args.epochs, args.vis,
-                  args.feat_dim, classes)
+            train(model, trainloader, criterion_xent, criterion_cent, args.weight_cent, optimizer, use_gpu, writer,
+                  epoch, args.epochs, args.vis, args.feat_dim, classes)
 
             if epoch % args.eval_freq == 0 or epoch == args.epochs - 1:
-                eval(model, testloader, criterion, scheduler, use_gpu, writer, epoch, args.epochs, args.vis,
-                     args.feat_dim, classes)
+                eval(model, testloader, criterion_xent, criterion_cent, scheduler, use_gpu, writer, epoch, args.epochs,
+                     args.vis, args.feat_dim, classes)
 
     elapsed_time = str(datetime.now() - start)
     print("Finish training. Total elapsed time %s." % elapsed_time)

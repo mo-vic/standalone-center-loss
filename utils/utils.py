@@ -56,8 +56,10 @@ def build_model(model, input_shape, feature_dims, num_classes):
     return model
 
 
-def train(model, dataloader, criterion, optimizer, use_gpu, writer, epoch, max_epoch, vis, feat_dim, classes):
+def train(model, dataloader, criterion_xent, criterion_cent, weight_cent, optimizer, use_gpu, writer, epoch, max_epoch,
+          vis, feat_dim, classes):
     model.train()
+    criterion_cent.train()
 
     if vis:
         if feat_dim == 2 or epoch == max_epoch - 1:
@@ -66,6 +68,9 @@ def train(model, dataloader, criterion, optimizer, use_gpu, writer, epoch, max_e
 
     all_acc = []
     all_loss = []
+    all_xent_loss = []
+    all_cent_loss = []
+    distmat = np.array([]).reshape((0, len(classes)))
 
     for idx, (data, labels) in tqdm(enumerate(dataloader), desc="Training Epoch {}".format(epoch)):
         optimizer.zero_grad()
@@ -73,9 +78,18 @@ def train(model, dataloader, criterion, optimizer, use_gpu, writer, epoch, max_e
             data, labels = data.cuda(), labels.cuda()
         features, outputs = model(data)
 
-        loss = criterion(outputs, labels)
+        loss_xent = criterion_xent(outputs, labels)
+        loss_cent, dist_data = criterion_cent(features, labels)
+        loss_cent *= weight_cent
+        loss = loss_xent + loss_cent
+
+        all_xent_loss.append(loss_xent.item())
+        all_cent_loss.append(loss_cent.item())
+
         loss.backward()
         optimizer.step()
+
+        distmat = np.concatenate([distmat, dist_data], axis=0)
 
         all_loss.append(loss.item())
         acc = (outputs.data.max(1)[1] == labels.data).double().mean()
@@ -83,6 +97,8 @@ def train(model, dataloader, criterion, optimizer, use_gpu, writer, epoch, max_e
 
         writer.add_scalar("loss", loss.item(), global_step=epoch * len(dataloader) + idx)
         writer.add_scalar("acc", acc.item(), global_step=epoch * len(dataloader) + idx)
+        writer.add_scalar("loss_xent", loss_xent.item(), global_step=epoch * len(dataloader) + idx)
+        writer.add_scalar("loss_cent", loss_cent.item(), global_step=epoch * len(dataloader) + idx)
 
         if vis:
             if feat_dim == 2 or epoch == max_epoch - 1:
@@ -91,16 +107,35 @@ def train(model, dataloader, criterion, optimizer, use_gpu, writer, epoch, max_e
             if feat_dim != 2 and epoch == max_epoch - 1:
                 all_images.append(data.data.cpu().numpy())
 
-    print("Epoch {}: total trainset loss: {}, global trainset accuracy:{}".format(epoch, np.mean(all_loss),
-                                                                                  np.mean(all_acc)))
+    mean = np.mean(distmat, axis=0)
+    std = np.std(distmat, axis=0)
+
+    for i, (m, s) in enumerate(zip(mean, std)):
+        writer.add_scalar("mean of %s" % i, m, global_step=epoch)
+        writer.add_scalar("std of %s" % i, s, global_step=epoch)
+
+    centers = criterion_cent.get_centers()
+    with torch.no_grad():
+        distmat = torch.pow(centers, 2).sum(dim=1, keepdim=True).expand(len(classes), len(classes)) + \
+                  torch.pow(centers, 2).sum(dim=1, keepdim=True).expand(len(classes), len(classes)).t()
+        distmat.addmm_(1, -2, centers, centers.t())
+        distmat = distmat.cpu().data
+        for i in range(len(classes)):
+            for j in range(i):
+                writer.add_scalar("%s-%s" % (i, j), distmat[i][j], global_step=epoch)
+
+    print("Epoch {}: total trainset loss: {}, global trainset accuracy:{}, global xent_loss:{}, global cent_loss:{}" \
+          .format(epoch, np.mean(all_loss), np.mean(all_acc), np.mean(all_xent_loss), np.mean(all_cent_loss)))
 
     if vis:
         if feat_dim == 2 or epoch == max_epoch - 1:
             visualize(all_images, all_features, all_labels, feat_dim, classes, epoch, writer, tag="train")
 
 
-def eval(model, dataloader, criterion, scheduler, use_gpu, writer, epoch, max_epoch, vis, feat_dim, classes):
+def eval(model, dataloader, criterion_xent, criterion_cent, scheduler, use_gpu, writer, epoch, max_epoch, vis, feat_dim,
+         classes):
     model.eval()
+    criterion_cent.eval()
 
     if vis:
         if feat_dim == 2 or epoch == max_epoch - 1:
@@ -109,13 +144,24 @@ def eval(model, dataloader, criterion, scheduler, use_gpu, writer, epoch, max_ep
 
     all_acc = []
     all_loss = []
+    all_xent_loss = []
+    all_cent_loss = []
+    distmat = np.array([]).reshape((0, len(classes)))
 
     with torch.no_grad():
         for idx, (data, labels) in tqdm(enumerate(dataloader), desc="Evaluating Epoch {}".format(epoch)):
             if use_gpu:
                 data, labels = data.cuda(), labels.cuda()
             features, outputs = model(data)
-            loss = criterion(outputs, labels)
+
+            loss_xent = criterion_xent(outputs, labels)
+            loss_cent, dist_data = criterion_cent(features, labels)
+            loss = loss_xent + loss_cent
+
+            all_xent_loss.append(loss_xent.item())
+            all_cent_loss.append(loss_cent.item())
+
+            distmat = np.concatenate([distmat, dist_data], axis=0)
 
             all_loss.append(loss.item())
             acc = (outputs.data.max(1)[1] == labels.data).double().mean()
@@ -130,9 +176,22 @@ def eval(model, dataloader, criterion, scheduler, use_gpu, writer, epoch, max_ep
 
         val_loss = np.mean(all_loss)
         val_acc = np.mean(all_acc)
+        val_xent_loss = np.mean(all_xent_loss)
+        val_cent_loss = np.mean(all_cent_loss)
         writer.add_scalar("val_loss", val_loss, global_step=epoch)
         writer.add_scalar("val_acc", val_acc, global_step=epoch)
-        print("Epoch {}: testset loss: {}, testset accuracy:{}".format(epoch, val_loss, val_acc))
+        writer.add_scalar("val_xent_loss", val_xent_loss, global_step=epoch)
+        writer.add_scalar("val_cent_loss", val_cent_loss, global_step=epoch)
+
+        mean = np.mean(distmat, axis=0)
+        std = np.std(distmat, axis=0)
+
+        for i, (m, s) in enumerate(zip(mean, std)):
+            writer.add_scalar("val_mean of %s" % i, m, global_step=epoch)
+            writer.add_scalar("val_std of %s" % i, s, global_step=epoch)
+
+        print("Epoch {}: testset loss: {}, testset accuracy:{}, val_xent_loss:{}, " \
+              "val_cent_loss:{}".format(epoch, val_loss, val_acc, val_xent_loss, val_cent_loss))
 
         scheduler.step(val_acc)
 
