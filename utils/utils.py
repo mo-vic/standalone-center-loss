@@ -56,10 +56,10 @@ def build_model(model, input_shape, feature_dims, num_classes):
     return model
 
 
-def train(model, dataloader, criterion_xent, criterion_cent, weight_cent, optimizer, use_gpu, writer, epoch, max_epoch,
-          vis, feat_dim, classes):
+def train(model, dataloader, criterion, weight_intra, weight_inter, optimizer, use_gpu, writer, epoch, max_epoch, vis,
+          feat_dim, classes):
     model.train()
-    criterion_cent.train()
+    criterion.train()
 
     if vis:
         if feat_dim == 2 or epoch == max_epoch - 1:
@@ -68,8 +68,8 @@ def train(model, dataloader, criterion_xent, criterion_cent, weight_cent, optimi
 
     all_acc = []
     all_loss = []
-    all_xent_loss = []
-    all_cent_loss = []
+    all_inter_loss = []
+    all_intra_loss = []
     distmat = np.array([]).reshape((0, len(classes)))
 
     for idx, (data, labels) in tqdm(enumerate(dataloader), desc="Training Epoch {}".format(epoch)):
@@ -78,27 +78,32 @@ def train(model, dataloader, criterion_xent, criterion_cent, weight_cent, optimi
             data, labels = data.cuda(), labels.cuda()
         features, outputs = model(data)
 
-        loss_xent = criterion_xent(outputs, labels)
-        loss_cent, dist_data = criterion_cent(features, labels)
-        loss_cent *= weight_cent
-        loss = loss_xent + loss_cent
+        intra_loss, inter_loss, intra_dist_data = criterion(features, labels)
+        intra_loss *= weight_intra
+        inter_loss *= -weight_inter
+        loss = intra_loss + inter_loss
 
-        all_xent_loss.append(loss_xent.item())
-        all_cent_loss.append(loss_cent.item())
+        all_inter_loss.append(inter_loss.item())
+        all_intra_loss.append(intra_loss.item())
 
         loss.backward()
         optimizer.step()
 
-        distmat = np.concatenate([distmat, dist_data], axis=0)
+        distmat = np.concatenate([distmat, intra_dist_data], axis=0)
 
         all_loss.append(loss.item())
-        acc = (outputs.data.max(1)[1] == labels.data).double().mean()
+        centers = criterion.get_centers().data
+        batch_size = features.size(0)
+        batch_distmat = torch.pow(features.data, 2).sum(dim=1, keepdim=True).expand(batch_size, len(classes)) + \
+                        torch.pow(centers, 2).sum(dim=1, keepdim=True).expand(len(classes), batch_size).t()
+        batch_distmat.addmm_(1, -2, features.data, centers.t())
+        acc = (batch_distmat.data.min(1)[1] == labels.data).double().mean()
         all_acc.append(acc.item())
 
         writer.add_scalar("loss", loss.item(), global_step=epoch * len(dataloader) + idx)
         writer.add_scalar("acc", acc.item(), global_step=epoch * len(dataloader) + idx)
-        writer.add_scalar("loss_xent", loss_xent.item(), global_step=epoch * len(dataloader) + idx)
-        writer.add_scalar("loss_cent", loss_cent.item(), global_step=epoch * len(dataloader) + idx)
+        writer.add_scalar("inter_loss", inter_loss.item(), global_step=epoch * len(dataloader) + idx)
+        writer.add_scalar("intra_loss", intra_loss.item(), global_step=epoch * len(dataloader) + idx)
 
         if vis:
             if feat_dim == 2 or epoch == max_epoch - 1:
@@ -114,7 +119,7 @@ def train(model, dataloader, criterion_xent, criterion_cent, weight_cent, optimi
         writer.add_scalar("mean of %s" % i, m, global_step=epoch)
         writer.add_scalar("std of %s" % i, s, global_step=epoch)
 
-    centers = criterion_cent.get_centers()
+    centers = criterion.get_centers()
     with torch.no_grad():
         distmat = torch.pow(centers, 2).sum(dim=1, keepdim=True).expand(len(classes), len(classes)) + \
                   torch.pow(centers, 2).sum(dim=1, keepdim=True).expand(len(classes), len(classes)).t()
@@ -124,18 +129,17 @@ def train(model, dataloader, criterion_xent, criterion_cent, weight_cent, optimi
             for j in range(i):
                 writer.add_scalar("%s-%s" % (i, j), distmat[i][j], global_step=epoch)
 
-    print("Epoch {}: total trainset loss: {}, global trainset accuracy:{}, global xent_loss:{}, global cent_loss:{}" \
-          .format(epoch, np.mean(all_loss), np.mean(all_acc), np.mean(all_xent_loss), np.mean(all_cent_loss)))
+    print("Epoch {}: total trainset loss: {}, global trainset accuracy:{}, global inter_loss:{}, global intra_loss:{}" \
+          .format(epoch, np.mean(all_loss), np.mean(all_acc), np.mean(all_inter_loss), np.mean(all_intra_loss)))
 
     if vis:
         if feat_dim == 2 or epoch == max_epoch - 1:
             visualize(all_images, all_features, all_labels, feat_dim, classes, epoch, writer, tag="train")
 
 
-def eval(model, dataloader, criterion_xent, criterion_cent, scheduler, use_gpu, writer, epoch, max_epoch, vis, feat_dim,
-         classes):
+def eval(model, dataloader, criterion, scheduler, use_gpu, writer, epoch, max_epoch, vis, feat_dim, classes):
     model.eval()
-    criterion_cent.eval()
+    criterion.eval()
 
     if vis:
         if feat_dim == 2 or epoch == max_epoch - 1:
@@ -144,27 +148,32 @@ def eval(model, dataloader, criterion_xent, criterion_cent, scheduler, use_gpu, 
 
     all_acc = []
     all_loss = []
-    all_xent_loss = []
-    all_cent_loss = []
+    all_inter_loss = []
+    all_intra_loss = []
     distmat = np.array([]).reshape((0, len(classes)))
 
     with torch.no_grad():
+        centers = criterion.get_centers()
         for idx, (data, labels) in tqdm(enumerate(dataloader), desc="Evaluating Epoch {}".format(epoch)):
             if use_gpu:
                 data, labels = data.cuda(), labels.cuda()
             features, outputs = model(data)
 
-            loss_xent = criterion_xent(outputs, labels)
-            loss_cent, dist_data = criterion_cent(features, labels)
-            loss = loss_xent + loss_cent
+            intra_loss, inter_loss, intra_dist_data = criterion(features, labels)
+            inter_loss *= -1.0
+            loss = intra_loss + inter_loss
 
-            all_xent_loss.append(loss_xent.item())
-            all_cent_loss.append(loss_cent.item())
+            all_inter_loss.append(inter_loss.item())
+            all_intra_loss.append(intra_loss.item())
 
-            distmat = np.concatenate([distmat, dist_data], axis=0)
+            distmat = np.concatenate([distmat, intra_dist_data], axis=0)
 
             all_loss.append(loss.item())
-            acc = (outputs.data.max(1)[1] == labels.data).double().mean()
+            batch_size = features.size(0)
+            batch_distmat = torch.pow(features, 2).sum(dim=1, keepdim=True).expand(batch_size, len(classes)) + \
+                            torch.pow(centers, 2).sum(dim=1, keepdim=True).expand(len(classes), batch_size).t()
+            batch_distmat.addmm_(1, -2, features, centers.t())
+            acc = (batch_distmat.data.min(1)[1] == labels.data).double().mean()
             all_acc.append(acc.item())
 
             if vis:
@@ -176,12 +185,12 @@ def eval(model, dataloader, criterion_xent, criterion_cent, scheduler, use_gpu, 
 
         val_loss = np.mean(all_loss)
         val_acc = np.mean(all_acc)
-        val_xent_loss = np.mean(all_xent_loss)
-        val_cent_loss = np.mean(all_cent_loss)
+        val_inter_loss = np.mean(all_inter_loss)
+        val_intra_loss = np.mean(all_intra_loss)
         writer.add_scalar("val_loss", val_loss, global_step=epoch)
         writer.add_scalar("val_acc", val_acc, global_step=epoch)
-        writer.add_scalar("val_xent_loss", val_xent_loss, global_step=epoch)
-        writer.add_scalar("val_cent_loss", val_cent_loss, global_step=epoch)
+        writer.add_scalar("val_inter_loss", val_inter_loss, global_step=epoch)
+        writer.add_scalar("val_intra_loss", val_intra_loss, global_step=epoch)
 
         mean = np.mean(distmat, axis=0)
         std = np.std(distmat, axis=0)
@@ -190,8 +199,8 @@ def eval(model, dataloader, criterion_xent, criterion_cent, scheduler, use_gpu, 
             writer.add_scalar("val_mean of %s" % i, m, global_step=epoch)
             writer.add_scalar("val_std of %s" % i, s, global_step=epoch)
 
-        print("Epoch {}: testset loss: {}, testset accuracy:{}, val_xent_loss:{}, " \
-              "val_cent_loss:{}".format(epoch, val_loss, val_acc, val_xent_loss, val_cent_loss))
+        print("Epoch {}: testset loss: {}, testset accuracy:{}, val_inter_loss:{}, " \
+              "val_intra_loss:{}".format(epoch, val_loss, val_acc, val_inter_loss, val_intra_loss))
 
         scheduler.step(val_acc)
 
